@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from bson import ObjectId
@@ -5,6 +6,8 @@ from bson import ObjectId
 from .repository import WorkerRepository
 from .crypto_helper import encrypt_dict, decrypt_dict, get_search_token
 from .database.main_db import workers_collection, daily_logs_collection
+
+logger = logging.getLogger(__name__)
 
 WORKER_SENSITIVE_FIELDS = ["worker_name", "phone", "notes"]
 LOG_SENSITIVE_FIELDS = [
@@ -72,8 +75,8 @@ class MongoDBWorkerRepository(WorkerRepository):
         for doc in documents:
             try:
                 results.append(self._serialize_worker(doc))
-            except ValueError:
-                pass
+            except ValueError as e:
+                logger.error(f"Skipping undecryptable worker document {doc.get('_id')}: {e}")
         return results
 
     def get_worker_by_id(self, worker_id: str) -> Optional[Dict[str, Any]]:
@@ -162,8 +165,8 @@ class MongoDBWorkerRepository(WorkerRepository):
         for doc in documents:
             try:
                 results.append(self._serialize_log(doc))
-            except ValueError:
-                pass
+            except ValueError as e:
+                logger.error(f"Skipping undecryptable daily log document {doc.get('_id')}: {e}")
         return results
 
     def get_log_by_id(self, log_id: str) -> Optional[Dict[str, Any]]:

@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from typing import Optional
 from datetime import datetime
 
@@ -32,30 +33,38 @@ import sentry_sdk
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# CORS configuration - allow all origins for now to avoid blocking
+# Known production frontend origins. Used as a safe default so the API is never
+# wide-open ("*") yet never fully locked down (which would break the live app if
+# the ALLOWED_ORIGINS env var is not injected by the platform).
+DEFAULT_ALLOWED_ORIGINS = [
+    "https://lovelaundry-manager.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+
+# CORS configuration - prefer the platform-provided allowlist; otherwise use the
+# known-good production origins. Never fall back to "*".
 try:
     ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
     if ALLOWED_ORIGINS_ENV:
         ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()]
         ALLOW_CREDENTIALS = True
     else:
-        # If not configured, allow all origins (development/production fallback)
-        ALLOWED_ORIGINS = ["*"]
-        ALLOW_CREDENTIALS = False
+        # If not configured, use the known production origins (never "*").
+        ALLOWED_ORIGINS = list(DEFAULT_ALLOWED_ORIGINS)
+        ALLOW_CREDENTIALS = True
 
     logger.info(f"CORS configured with origins: {ALLOWED_ORIGINS}, credentials: {ALLOW_CREDENTIALS}")
 except Exception as e:
-    logger.warning(f"CORS configuration failed, using defaults: {e}")
-    ALLOWED_ORIGINS = ["*"]
-    ALLOW_CREDENTIALS = False
-
-ON_VERCEL = os.getenv("VERCEL") == "1"
+    logger.warning(f"CORS configuration failed, using safe default: {e}")
+    ALLOWED_ORIGINS = list(DEFAULT_ALLOWED_ORIGINS)
+    ALLOW_CREDENTIALS = True
 
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 if SENTRY_DSN:
     sentry_sdk.init(
         dsn=SENTRY_DSN,
-        traces_sample_rate=1.0,
+        traces_sample_rate=0.1,
     )
 
 app = FastAPI(title="Worker Daily Task Service", version="1.0.0")
@@ -67,6 +76,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error("Unhandled exception", exc_info=exc)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 @app.on_event("startup")
@@ -148,10 +163,7 @@ def get_worker(
     worker_id: str,
     repo: WorkerRepository = Depends(get_repository),
 ):
-    if DB_TYPE == DatabaseType.MONGODB:
-        worker = repo.get_worker_by_id(str(worker_id))
-    else:
-        worker = repo.get_worker_by_id(int(worker_id))
+    worker = repo.get_worker_by_id(_coerce_db_id(worker_id))
 
     if not worker:
         raise HTTPException(status_code=404, detail="Worker not found")
@@ -196,7 +208,7 @@ def update_worker(
     if DB_TYPE == DatabaseType.MONGODB:
         worker_id = str(worker_id)
     else:
-        worker_id = int(worker_id)
+        worker_id = _coerce_db_id(worker_id)
 
     update_data = payload.model_dump(exclude_unset=True)
     if "department" in update_data and update_data["department"]:
@@ -221,7 +233,7 @@ def delete_worker(
     if DB_TYPE == DatabaseType.MONGODB:
         worker_id = str(worker_id)
     else:
-        worker_id = int(worker_id)
+        worker_id = _coerce_db_id(worker_id)
 
     success = repo.delete_worker(worker_id)
     if not success:
@@ -265,7 +277,7 @@ def get_daily_log(
     if DB_TYPE == DatabaseType.MONGODB:
         log = repo.get_log_by_id(str(log_id))
     else:
-        log = repo.get_log_by_id(int(log_id))
+        log = repo.get_log_by_id(_coerce_db_id(log_id))
 
     if not log:
         raise HTTPException(status_code=404, detail="Daily log not found")
@@ -312,7 +324,7 @@ def update_daily_log(
     if DB_TYPE == DatabaseType.MONGODB:
         log_id = str(log_id)
     else:
-        log_id = int(log_id)
+        log_id = _coerce_db_id(log_id)
 
     update_data = payload.model_dump(exclude_unset=True)
 
@@ -330,6 +342,19 @@ def update_daily_log(
         update_data["attendance_status"] = update_data["attendance_status"].upper()
 
     if "tasks" in update_data and update_data["tasks"] is not None:
+        for t in update_data["tasks"]:
+            ttype = t.get("task_type") if isinstance(t, dict) else getattr(t, "task_type", None)
+            tunit = t.get("unit") if isinstance(t, dict) else getattr(t, "unit", None)
+            if ttype is None or str(ttype).upper() not in TASK_TYPES:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Task type must be one of {TASK_TYPES}",
+                )
+            if tunit is None or str(tunit).upper() not in TASK_UNITS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Task unit must be one of {TASK_UNITS}",
+                )
         update_data["tasks"] = [
             t.model_dump() if hasattr(t, "model_dump") else t for t in update_data["tasks"]
         ]
@@ -351,7 +376,7 @@ def delete_daily_log(
     if DB_TYPE == DatabaseType.MONGODB:
         log_id = str(log_id)
     else:
-        log_id = int(log_id)
+        log_id = _coerce_db_id(log_id)
 
     success = repo.delete_log(log_id)
     if not success:
@@ -499,6 +524,16 @@ def range_summary(
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _coerce_db_id(raw_id: str):
+    """Coerce a path id to the repository's expected type, returning a clean 404 on invalid ids."""
+    if DB_TYPE == DatabaseType.MONGODB:
+        return str(raw_id)
+    try:
+        return int(raw_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="Resource not found")
 
 
 def _validate_log_payload(shift: str, attendance_status: str, tasks: list):
