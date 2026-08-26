@@ -46,6 +46,7 @@ class TaskEntry(BaseModel):
     hours_spent: Optional[float] = Field(None, ge=0)
     gate_pass_id: Optional[str] = None
     gate_pass_number: Optional[str] = None
+    remark: Optional[str] = None
 
 
 # ─── Workers ──────────────────────────────────────────────────────────────────
