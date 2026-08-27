@@ -49,6 +49,10 @@ class DailyTaskLog(Base):
     # Detailed task entries [{task_type, description, quantity, unit}]
     tasks: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
+    # Group / together work — a task performed collaboratively by several workers
+    is_group_work: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    team_members: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
     # Quality tracking
     rewash_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     damaged_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

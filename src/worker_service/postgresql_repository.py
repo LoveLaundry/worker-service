@@ -97,6 +97,8 @@ class PostgreSQLWorkerRepository(WorkerRepository):
             "other_count": log.other_count,
             "total_weight_kg": log.total_weight_kg,
             "tasks": tasks,
+            "is_group_work": log.is_group_work,
+            "team_members": log.team_members or [],
             "rewash_count": log.rewash_count,
             "damaged_items": log.damaged_items,
             "complaints": log.complaints,

@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Optional
 from datetime import datetime
+from sqlalchemy import text
 
 from .config import DB_TYPE, DatabaseType
 from .repository import WorkerRepository
@@ -97,10 +98,51 @@ def startup_event():
 
             if engine:
                 Base.metadata.create_all(bind=engine)
+            _migrate_schema()
         else:
             ensure_indexes()
     except Exception:
         logger.exception("Failed to initialize database schema on startup")
+
+
+def _migrate_schema():
+    """Add columns to existing tables.
+
+    SQLAlchemy's create_all only creates missing *tables*, not new columns on
+    existing ones. For Postgres/SQLite we ALTER the table idempotently so a
+    redeploy picks up the new group-work fields without a manual migration.
+    """
+    if DB_TYPE not in (DatabaseType.POSTGRESQL, DatabaseType.SQLITE):
+        return
+    try:
+        from .database import engine
+
+        if engine is None:
+            return
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
+                    "is_group_work BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+            if DB_TYPE == DatabaseType.POSTGRESQL:
+                conn.execute(
+                    text(
+                        "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
+                        "team_members JSON NOT NULL DEFAULT '[]'::json"
+                    )
+                )
+            else:
+                conn.execute(
+                    text(
+                        "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
+                        "team_members JSON NOT NULL DEFAULT '[]'"
+                    )
+                )
+        logger.info("Schema migration check completed")
+    except Exception:
+        logger.exception("Schema migration failed")
 
 
 @app.on_event("shutdown")
@@ -312,6 +354,22 @@ def create_daily_log(
     # Auto-fill quick counts from task entries when they are zero
     _sync_task_counts(log_data)
 
+    # Group / together work — normalise team membership and derive a stable
+    # worker_name label ("A + B") so individual logs and group logs stay distinct.
+    if payload.is_group_work:
+        team = [m for m in (payload.team_members or []) if m]
+        if len(team) < 2:
+            raise HTTPException(
+                status_code=422,
+                detail="Group work requires at least 2 team members",
+            )
+        log_data["is_group_work"] = True
+        log_data["team_members"] = team
+        log_data["worker_name"] = " + ".join(team)
+    else:
+        log_data["is_group_work"] = False
+        log_data["team_members"] = []
+
     return repo.create_log(log_data)
 
 
@@ -362,6 +420,16 @@ def update_daily_log(
         update_data["tasks"] = [
             t.model_dump() if hasattr(t, "model_dump") else t for t in update_data["tasks"]
         ]
+
+    # Recompute the worker_name label when a group is (re)defined on update.
+    if update_data.get("is_group_work") and update_data.get("team_members") is not None:
+        team = [m for m in update_data["team_members"] if m]
+        if len(team) < 2:
+            raise HTTPException(
+                status_code=422,
+                detail="Group work requires at least 2 team members",
+            )
+        update_data["worker_name"] = " + ".join(team)
 
     updated_log = repo.update_log(log_id, update_data)
     if not updated_log:
@@ -426,7 +494,10 @@ def daily_summary(
     s = _empty_summary(date)
 
     for log in logs:
-        s["workers_logged"] += 1
+        if log.get("is_group_work"):
+            s["workers_logged"] += max(1, len(log.get("team_members") or []))
+        else:
+            s["workers_logged"] += 1
         attendance = str(log.get("attendance_status", "")).upper()
         if attendance == "PRESENT":
             s["present"] += 1
@@ -467,48 +538,56 @@ def range_summary(
 
     per_worker: dict = {}
     for log in logs:
-        name = log.get("worker_name", "Unknown")
-        entry = per_worker.setdefault(
-            name,
-            {
-                "worker_name": name,
-                "days_logged": 0,
-                "present_days": 0,
-                "total_washed": 0,
-                "total_pressed": 0,
-                "total_folded": 0,
-                "total_packed": 0,
-                "total_other": 0,
-                "total_pieces": 0,
-                "total_weight_kg": 0.0,
-                "total_overtime_hours": 0.0,
-                "total_rewash": 0,
-                "total_damaged": 0,
-                "avg_performance_rating": [],
-            },
-        )
-        entry["days_logged"] += 1
-        attendance = str(log.get("attendance_status", "")).upper()
-        if attendance in ("PRESENT", "HALF_DAY"):
-            entry["present_days"] += 1
-        washed = int(log.get("washed_count") or 0)
-        pressed = int(log.get("pressed_count") or 0)
-        folded = int(log.get("folded_count") or 0)
-        packed = int(log.get("packed_count") or 0)
-        other = int(log.get("other_count") or 0)
-        entry["total_washed"] += washed
-        entry["total_pressed"] += pressed
-        entry["total_folded"] += folded
-        entry["total_packed"] += packed
-        entry["total_other"] += other
-        entry["total_pieces"] += washed + pressed + folded + packed + other
-        entry["total_weight_kg"] += float(log.get("total_weight_kg") or 0)
-        entry["total_overtime_hours"] += float(log.get("overtime_hours") or 0)
-        entry["total_rewash"] += int(log.get("rewash_count") or 0)
-        entry["total_damaged"] += int(log.get("damaged_items") or 0)
-        rating = log.get("performance_rating")
-        if rating:
-            entry["avg_performance_rating"].append(float(rating))
+        # Group works are credited to every team member individually so per-worker
+        # reporting reflects each person's contribution.
+        if log.get("is_group_work"):
+            credited = [m for m in (log.get("team_members") or []) if m]
+        else:
+            credited = [log.get("worker_name")]
+        for name in credited:
+            if not name:
+                continue
+            entry = per_worker.setdefault(
+                name,
+                {
+                    "worker_name": name,
+                    "days_logged": 0,
+                    "present_days": 0,
+                    "total_washed": 0,
+                    "total_pressed": 0,
+                    "total_folded": 0,
+                    "total_packed": 0,
+                    "total_other": 0,
+                    "total_pieces": 0,
+                    "total_weight_kg": 0.0,
+                    "total_overtime_hours": 0.0,
+                    "total_rewash": 0,
+                    "total_damaged": 0,
+                    "avg_performance_rating": [],
+                },
+            )
+            entry["days_logged"] += 1
+            attendance = str(log.get("attendance_status", "")).upper()
+            if attendance in ("PRESENT", "HALF_DAY"):
+                entry["present_days"] += 1
+            washed = int(log.get("washed_count") or 0)
+            pressed = int(log.get("pressed_count") or 0)
+            folded = int(log.get("folded_count") or 0)
+            packed = int(log.get("packed_count") or 0)
+            other = int(log.get("other_count") or 0)
+            entry["total_washed"] += washed
+            entry["total_pressed"] += pressed
+            entry["total_folded"] += folded
+            entry["total_packed"] += packed
+            entry["total_other"] += other
+            entry["total_pieces"] += washed + pressed + folded + packed + other
+            entry["total_weight_kg"] += float(log.get("total_weight_kg") or 0)
+            entry["total_overtime_hours"] += float(log.get("overtime_hours") or 0)
+            entry["total_rewash"] += int(log.get("rewash_count") or 0)
+            entry["total_damaged"] += int(log.get("damaged_items") or 0)
+            rating = log.get("performance_rating")
+            if rating:
+                entry["avg_performance_rating"].append(float(rating))
 
     results = []
     for entry in per_worker.values():

@@ -109,6 +109,8 @@ class DailyLogCreate(BaseModel):
     chemicals_used: Optional[str] = None
     notes: Optional[str] = None
     performance_rating: Optional[int] = Field(None, ge=1, le=5)
+    is_group_work: bool = False
+    team_members: list[str] = []
 
 
 class DailyLogUpdate(BaseModel):
@@ -135,6 +137,8 @@ class DailyLogUpdate(BaseModel):
     chemicals_used: Optional[str] = None
     notes: Optional[str] = None
     performance_rating: Optional[int] = Field(None, ge=1, le=5)
+    is_group_work: Optional[bool] = False
+    team_members: Optional[list[str]] = []
 
 
 class DailyLogResponse(BaseModel):
@@ -162,6 +166,8 @@ class DailyLogResponse(BaseModel):
     chemicals_used: Optional[str] = None
     notes: Optional[str] = None
     performance_rating: Optional[int] = None
+    is_group_work: bool = False
+    team_members: list[str] = []
     created_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
