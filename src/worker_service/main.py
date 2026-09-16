@@ -1,5 +1,4 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import Optional
 from datetime import datetime
@@ -43,27 +42,8 @@ DEFAULT_ALLOWED_ORIGINS = [
     "http://localhost:3000",
 ]
 
-# CORS configuration - prefer the platform-provided allowlist; otherwise use the
-# known-good production origins. Never fall back to "*".
-try:
-    ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
-    # Always keep the known-good production origins in the allowlist, and never
-    # accept a literal "*" (Starlette refuses "*" when credentials are enabled).
-    # This way a missing or misconfigured ALLOWED_ORIGINS env can never lock out
-    # the live frontend.
-    configured = [
-        o.strip()
-        for o in ALLOWED_ORIGINS_ENV.split(",")
-        if o.strip() and o.strip() != "*"
-    ]
-    ALLOWED_ORIGINS = list(dict.fromkeys(configured + list(DEFAULT_ALLOWED_ORIGINS)))
-    ALLOW_CREDENTIALS = True
-
-    logger.info(f"CORS configured with origins: {ALLOWED_ORIGINS}, credentials: {ALLOW_CREDENTIALS}")
-except Exception as e:
-    logger.warning(f"CORS configuration failed, using safe default: {e}")
-    ALLOWED_ORIGINS = list(DEFAULT_ALLOWED_ORIGINS)
-    ALLOW_CREDENTIALS = True
+# CORS configuration delegated to security module (security.py).
+# Origins are read from CORS_ORIGINS / ALLOWED_ORIGINS env with safe defaults.
 
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 if SENTRY_DSN:
@@ -74,13 +54,9 @@ if SENTRY_DSN:
 
 app = FastAPI(title="Worker Daily Task Service", version="1.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=ALLOW_CREDENTIALS,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from .security import apply_security, insecure_flags
+
+apply_security(app, rate_limit=300)
 
 
 @app.exception_handler(Exception)
@@ -169,7 +145,14 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "security": {
+            "headers": True,
+            "rate_limiting": True,
+            "insecure_defaults": insecure_flags(),
+        },
+    }
 
 
 @app.get("/meta")
