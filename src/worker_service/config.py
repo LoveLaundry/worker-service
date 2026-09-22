@@ -81,4 +81,4 @@ def resolve_local_uri() -> str:
 
 
 def resolve_local_db() -> str:
-    return MONGODB_LOCAL_URI or f"{resolve_main_db()}_local"
+    return MONGODB_LOCAL_DB or f"{resolve_main_db()}_local"
