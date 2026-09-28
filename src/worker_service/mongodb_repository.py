@@ -1,4 +1,5 @@
 import logging
+from ..app_time import UTC
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from bson import ObjectId
@@ -89,7 +90,7 @@ class MongoDBWorkerRepository(WorkerRepository):
             return None
 
     def create_worker(self, worker_data: Dict[str, Any]) -> Dict[str, Any]:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         document = {
             **worker_data,
             "created_at": now,
@@ -113,7 +114,7 @@ class MongoDBWorkerRepository(WorkerRepository):
 
             decrypted_original.update(update_data)
             decrypted_original.pop("created_at", None)
-            decrypted_original["updated_at"] = datetime.utcnow()
+            decrypted_original["updated_at"] = datetime.now(UTC)
 
             encrypted_new = encrypt_dict(decrypted_original, WORKER_SENSITIVE_FIELDS)
 
@@ -179,7 +180,7 @@ class MongoDBWorkerRepository(WorkerRepository):
             return None
 
     def create_log(self, log_data: Dict[str, Any]) -> Dict[str, Any]:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         document = {
             **log_data,
             "worker_name_search": get_search_token(log_data.get("worker_name", "")),
@@ -210,7 +211,7 @@ class MongoDBWorkerRepository(WorkerRepository):
                     update_data["worker_name"]
                 )
 
-            decrypted_original["updated_at"] = datetime.utcnow()
+            decrypted_original["updated_at"] = datetime.now(UTC)
 
             encrypted_new = encrypt_dict(decrypted_original, LOG_SENSITIVE_FIELDS)
 

@@ -4,6 +4,7 @@ from typing import Optional
 from datetime import datetime
 from sqlalchemy import text
 
+from .app_time import utc_iso_z
 from .config import DB_TYPE, DatabaseType
 from .repository import WorkerRepository
 from .repository_factory import get_repository, close_connections
@@ -584,7 +585,7 @@ def range_summary(
     return {
         "date_from": date_from,
         "date_to": date_to,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utc_iso_z(),
         "workers": results,
     }
 
