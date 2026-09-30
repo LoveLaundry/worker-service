@@ -1,5 +1,5 @@
 import logging
-from ..app_time import UTC
+from .app_time import UTC
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from bson import ObjectId
