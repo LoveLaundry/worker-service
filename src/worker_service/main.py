@@ -82,12 +82,20 @@ def startup_event():
         logger.exception("Failed to initialize database schema on startup")
 
 
+def _sqlite_column_exists(conn, table: str, column: str) -> bool:
+    rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+    return any(r[1] == column for r in rows)
+
+
 def _migrate_schema():
     """Add columns to existing tables.
 
     SQLAlchemy's create_all only creates missing *tables*, not new columns on
     existing ones. For Postgres/SQLite we ALTER the table idempotently so a
     redeploy picks up the new group-work fields without a manual migration.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``, so the driver needs explicit
+    (unquoted) names only when the column is actually absent.
     """
     if DB_TYPE not in (DatabaseType.POSTGRESQL, DatabaseType.SQLITE):
         return
@@ -97,13 +105,13 @@ def _migrate_schema():
         if engine is None:
             return
         with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
-                    "is_group_work BOOLEAN NOT NULL DEFAULT FALSE"
-                )
-            )
             if DB_TYPE == DatabaseType.POSTGRESQL:
+                conn.execute(
+                    text(
+                        "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
+                        "is_group_work BOOLEAN NOT NULL DEFAULT FALSE"
+                    )
+                )
                 conn.execute(
                     text(
                         "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
@@ -111,12 +119,20 @@ def _migrate_schema():
                     )
                 )
             else:
-                conn.execute(
-                    text(
-                        "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
-                        "team_members JSON NOT NULL DEFAULT '[]'"
+                if not _sqlite_column_exists(conn, "daily_task_logs", "is_group_work"):
+                    conn.execute(
+                        text(
+                            "ALTER TABLE daily_task_logs ADD COLUMN "
+                            "is_group_work BOOLEAN NOT NULL DEFAULT FALSE"
+                        )
                     )
-                )
+                if not _sqlite_column_exists(conn, "daily_task_logs", "team_members"):
+                    conn.execute(
+                        text(
+                            "ALTER TABLE daily_task_logs ADD COLUMN "
+                            "team_members JSON NOT NULL DEFAULT '[]'"
+                        )
+                    )
         logger.info("Schema migration check completed")
     except Exception:
         logger.exception("Schema migration failed")
@@ -405,15 +421,43 @@ def update_daily_log(
             t.model_dump() if hasattr(t, "model_dump") else t for t in update_data["tasks"]
         ]
 
-    # Recompute the worker_name label when a group is (re)defined on update.
-    if update_data.get("is_group_work") and update_data.get("team_members") is not None:
-        team = [m for m in update_data["team_members"] if m]
-        if len(team) < 2:
-            raise HTTPException(
-                status_code=422,
-                detail="Group work requires at least 2 team members",
-            )
-        update_data["worker_name"] = " + ".join(team)
+    # Recompute the worker_name label whenever the group definition is touched
+    # — flipping is_group_work, or editing team_members — not only when both
+    # arrive in the same body. Otherwise a team edit alone leaves an outdated
+    # "A + B" label (or group logs keep a stale single-worker name).
+    if "is_group_work" in update_data or "team_members" in update_data:
+        current = repo.get_log_by_id(log_id)
+        if not current:
+            raise HTTPException(status_code=404, detail="Daily log not found")
+
+        effective_group = (
+            update_data["is_group_work"]
+            if "is_group_work" in update_data
+            else bool(current.get("is_group_work"))
+        )
+        if "team_members" in update_data:
+            team = [m for m in (update_data["team_members"] or []) if m]
+        else:
+            team = [m for m in (current.get("team_members") or []) if m]
+
+        if effective_group:
+            if "team_members" in update_data and len(team) < 2:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Group work requires at least 2 team members",
+                )
+            if not team:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Group work requires at least 2 team members",
+                )
+            update_data["worker_name"] = " + ".join(team)
+        else:
+            # Back to an individual log. Prefer an explicit worker_name; the
+            # group label holds no single base name to fall back on.
+            if not update_data.get("worker_name"):
+                update_data.pop("worker_name", None)
+            update_data["team_members"] = []
 
     updated_log = repo.update_log(log_id, update_data)
     if not updated_log:
