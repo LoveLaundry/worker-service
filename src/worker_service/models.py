@@ -14,6 +14,8 @@ class Worker(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     joined_date: Mapped[str | None] = mapped_column(String, nullable=True)
     notes: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Tenant scope (NULL = pre-tenancy row, reads as LoveLaundry's — see tenancy.py)
+    laundry_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     created_at: Mapped[str | None] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=True
     )
@@ -65,6 +67,8 @@ class DailyTaskLog(Base):
     notes: Mapped[str | None] = mapped_column(String, nullable=True)
     performance_rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Tenant scope (NULL = pre-tenancy row, reads as LoveLaundry's — see tenancy.py)
+    laundry_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     created_at: Mapped[str | None] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=True
     )

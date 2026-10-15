@@ -7,6 +7,7 @@ from bson import ObjectId
 from .repository import WorkerRepository
 from .crypto_helper import encrypt_dict, decrypt_dict, get_search_token
 from .database.main_db import workers_collection, daily_logs_collection
+from .tenancy import LOVE_LAUNDRY_ID
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,35 @@ class MongoDBWorkerRepository(WorkerRepository):
         self.logs.create_index("work_date")
         self.logs.create_index("worker_name_search")
         self.logs.create_index([("work_date", 1), ("worker_name_search", 1)])
+
+    # ─── Tenant scoping ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _scope(query: Optional[Dict[str, Any]], laundry_id: Optional[str]) -> Dict[str, Any]:
+        """Merge a business filter with the tenant scope.
+
+        ``laundry_id=None`` means unscoped (system/platform callers only —
+        never a request path). Pre-tenancy documents without ``laundry_id``
+        belong to LoveLaundry, the sole historical tenant, so for
+        ``lovelaundry`` the scope also matches missing/null values; every
+        other laundry matches strictly its own stamped documents.
+        """
+        business = dict(query or {})
+        if laundry_id is None:
+            return business
+        if laundry_id == LOVE_LAUNDRY_ID:
+            tenant: Dict[str, Any] = {
+                "$or": [
+                    {"laundry_id": laundry_id},
+                    {"laundry_id": {"$exists": False}},
+                    {"laundry_id": None},
+                ]
+            }
+        else:
+            tenant = {"laundry_id": laundry_id}
+        if business:
+            return {"$and": [business, tenant]}
+        return tenant
 
     # ─── Serialization helpers ────────────────────────────────────────────
 
@@ -69,9 +99,11 @@ class MongoDBWorkerRepository(WorkerRepository):
 
     # ─── Workers ──────────────────────────────────────────────────────────
 
-    def get_all_workers(self, active_only: bool = False) -> List[Dict[str, Any]]:
+    def get_all_workers(
+        self, active_only: bool = False, laundry_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         query = {"is_active": True} if active_only else {}
-        documents = self.workers.find(query).sort("worker_name", 1)
+        documents = self.workers.find(self._scope(query, laundry_id)).sort("worker_name", 1)
         results = []
         for doc in documents:
             try:
@@ -80,30 +112,43 @@ class MongoDBWorkerRepository(WorkerRepository):
                 logger.error(f"Skipping undecryptable worker document {doc.get('_id')}: {e}")
         return results
 
-    def get_worker_by_id(self, worker_id: str) -> Optional[Dict[str, Any]]:
+    def get_worker_by_id(
+        self, worker_id: str, laundry_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         try:
-            doc = self.workers.find_one({"_id": ObjectId(worker_id)})
+            doc = self.workers.find_one(self._scope({"_id": ObjectId(worker_id)}, laundry_id))
             if not doc:
                 return None
             return self._serialize_worker(doc)
         except Exception:
             return None
 
-    def create_worker(self, worker_data: Dict[str, Any]) -> Dict[str, Any]:
+    def create_worker(
+        self, worker_data: Dict[str, Any], laundry_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         now = datetime.now(UTC)
         document = {
             **worker_data,
             "created_at": now,
             "updated_at": now,
         }
+        if laundry_id is not None:
+            document["laundry_id"] = laundry_id
         encrypted_document = encrypt_dict(document, WORKER_SENSITIVE_FIELDS)
         result = self.workers.insert_one(encrypted_document)
         encrypted_document["_id"] = result.inserted_id
         return self._serialize_worker(encrypted_document)
 
-    def update_worker(self, worker_id: str, update_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def update_worker(
+        self,
+        worker_id: str,
+        update_data: Dict[str, Any],
+        laundry_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         try:
-            original = self.workers.find_one({"_id": ObjectId(worker_id)})
+            original = self.workers.find_one(
+                self._scope({"_id": ObjectId(worker_id)}, laundry_id)
+            )
             if not original:
                 return None
 
@@ -119,7 +164,7 @@ class MongoDBWorkerRepository(WorkerRepository):
             encrypted_new = encrypt_dict(decrypted_original, WORKER_SENSITIVE_FIELDS)
 
             result = self.workers.find_one_and_update(
-                {"_id": ObjectId(worker_id)},
+                self._scope({"_id": ObjectId(worker_id)}, laundry_id),
                 {"$set": encrypted_new},
                 return_document=True,
             )
@@ -129,9 +174,13 @@ class MongoDBWorkerRepository(WorkerRepository):
         except Exception:
             return None
 
-    def delete_worker(self, worker_id: str) -> bool:
+    def delete_worker(
+        self, worker_id: str, laundry_id: Optional[str] = None
+    ) -> bool:
         try:
-            result = self.workers.delete_one({"_id": ObjectId(worker_id)})
+            result = self.workers.delete_one(
+                self._scope({"_id": ObjectId(worker_id)}, laundry_id)
+            )
             return result.deleted_count > 0
         except Exception:
             return False
@@ -144,6 +193,7 @@ class MongoDBWorkerRepository(WorkerRepository):
         worker_name: Optional[str] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
+        laundry_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         query: Dict[str, Any] = {}
         if work_date:
@@ -159,7 +209,7 @@ class MongoDBWorkerRepository(WorkerRepository):
         if worker_name:
             query["worker_name_search"] = get_search_token(worker_name)
 
-        documents = self.logs.find(query).sort(
+        documents = self.logs.find(self._scope(query, laundry_id)).sort(
             [("work_date", -1), ("worker_name", 1)]
         )
         results = []
@@ -170,16 +220,20 @@ class MongoDBWorkerRepository(WorkerRepository):
                 logger.error(f"Skipping undecryptable daily log document {doc.get('_id')}: {e}")
         return results
 
-    def get_log_by_id(self, log_id: str) -> Optional[Dict[str, Any]]:
+    def get_log_by_id(
+        self, log_id: str, laundry_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         try:
-            doc = self.logs.find_one({"_id": ObjectId(log_id)})
+            doc = self.logs.find_one(self._scope({"_id": ObjectId(log_id)}, laundry_id))
             if not doc:
                 return None
             return self._serialize_log(doc)
         except Exception:
             return None
 
-    def create_log(self, log_data: Dict[str, Any]) -> Dict[str, Any]:
+    def create_log(
+        self, log_data: Dict[str, Any], laundry_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         now = datetime.now(UTC)
         document = {
             **log_data,
@@ -187,14 +241,21 @@ class MongoDBWorkerRepository(WorkerRepository):
             "created_at": now,
             "updated_at": now,
         }
+        if laundry_id is not None:
+            document["laundry_id"] = laundry_id
         encrypted_document = encrypt_dict(document, LOG_SENSITIVE_FIELDS)
         result = self.logs.insert_one(encrypted_document)
         encrypted_document["_id"] = result.inserted_id
         return self._serialize_log(encrypted_document)
 
-    def update_log(self, log_id: str, update_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def update_log(
+        self,
+        log_id: str,
+        update_data: Dict[str, Any],
+        laundry_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         try:
-            original = self.logs.find_one({"_id": ObjectId(log_id)})
+            original = self.logs.find_one(self._scope({"_id": ObjectId(log_id)}, laundry_id))
             if not original:
                 return None
 
@@ -216,7 +277,7 @@ class MongoDBWorkerRepository(WorkerRepository):
             encrypted_new = encrypt_dict(decrypted_original, LOG_SENSITIVE_FIELDS)
 
             result = self.logs.find_one_and_update(
-                {"_id": ObjectId(log_id)},
+                self._scope({"_id": ObjectId(log_id)}, laundry_id),
                 {"$set": encrypted_new},
                 return_document=True,
             )
@@ -226,9 +287,9 @@ class MongoDBWorkerRepository(WorkerRepository):
         except Exception:
             return None
 
-    def delete_log(self, log_id: str) -> bool:
+    def delete_log(self, log_id: str, laundry_id: Optional[str] = None) -> bool:
         try:
-            result = self.logs.delete_one({"_id": ObjectId(log_id)})
+            result = self.logs.delete_one(self._scope({"_id": ObjectId(log_id)}, laundry_id))
             return result.deleted_count > 0
         except Exception:
             return False

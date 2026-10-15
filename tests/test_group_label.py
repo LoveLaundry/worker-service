@@ -40,7 +40,15 @@ def client(monkeypatch):
     return TestClient(app)
 
 
-TOKEN = create_access_token({"role": "ADMIN", "username": "tester", "sub": "tester"})
+TOKEN = create_access_token(
+    {
+        "role": "ADMIN",
+        "username": "tester",
+        "sub": "tester",
+        "laundry_id": "lovelaundry",
+        "laundries": [{"id": "lovelaundry", "role": "ADMIN", "status": "ACTIVE"}],
+    }
+)
 
 
 def _headers():
