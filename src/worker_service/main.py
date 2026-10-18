@@ -1,4 +1,3 @@
-from .tenancy import TenantMiddleware
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from typing import Optional
@@ -61,7 +60,6 @@ from .security import apply_security, insecure_flags
 
 apply_security(app, rate_limit=300)
 
-app.add_middleware(TenantMiddleware)
 
 
 @app.exception_handler(Exception)
