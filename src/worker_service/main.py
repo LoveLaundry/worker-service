@@ -5,6 +5,7 @@ from typing import Optional
 from datetime import datetime
 from sqlalchemy import text
 
+from .app_time import utc_iso_z
 from .config import DB_TYPE, DatabaseType
 from .repository import WorkerRepository
 from .repository_factory import get_repository, close_connections
@@ -23,6 +24,7 @@ from .schemas import (
     DailySummaryResponse,
 )
 from .auth_helper import get_current_user, require_role
+from .tenancy import assert_same_laundry, resolve_laundry_id
 from .database.main_db import ensure_indexes
 from .database.connection_manager import close_all
 
@@ -84,12 +86,20 @@ def startup_event():
         logger.exception("Failed to initialize database schema on startup")
 
 
+def _sqlite_column_exists(conn, table: str, column: str) -> bool:
+    rows = conn.execute(text(f"PRAGMA table_info({table})")).fetchall()
+    return any(r[1] == column for r in rows)
+
+
 def _migrate_schema():
     """Add columns to existing tables.
 
     SQLAlchemy's create_all only creates missing *tables*, not new columns on
     existing ones. For Postgres/SQLite we ALTER the table idempotently so a
     redeploy picks up the new group-work fields without a manual migration.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``, so the driver needs explicit
+    (unquoted) names only when the column is actually absent.
     """
     if DB_TYPE not in (DatabaseType.POSTGRESQL, DatabaseType.SQLITE):
         return
@@ -99,26 +109,51 @@ def _migrate_schema():
         if engine is None:
             return
         with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
-                    "is_group_work BOOLEAN NOT NULL DEFAULT FALSE"
-                )
-            )
             if DB_TYPE == DatabaseType.POSTGRESQL:
+                conn.execute(
+                    text(
+                        "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
+                        "is_group_work BOOLEAN NOT NULL DEFAULT FALSE"
+                    )
+                )
                 conn.execute(
                     text(
                         "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
                         "team_members JSON NOT NULL DEFAULT '[]'::json"
                     )
                 )
-            else:
+                # Multi-tenancy: nullable so pre-tenancy rows read as LoveLaundry's.
+                conn.execute(
+                    text("ALTER TABLE workers ADD COLUMN IF NOT EXISTS laundry_id VARCHAR")
+                )
                 conn.execute(
                     text(
-                        "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS "
-                        "team_members JSON NOT NULL DEFAULT '[]'"
+                        "ALTER TABLE daily_task_logs ADD COLUMN IF NOT EXISTS laundry_id VARCHAR"
                     )
                 )
+            else:
+                if not _sqlite_column_exists(conn, "daily_task_logs", "is_group_work"):
+                    conn.execute(
+                        text(
+                            "ALTER TABLE daily_task_logs ADD COLUMN "
+                            "is_group_work BOOLEAN NOT NULL DEFAULT FALSE"
+                        )
+                    )
+                if not _sqlite_column_exists(conn, "daily_task_logs", "team_members"):
+                    conn.execute(
+                        text(
+                            "ALTER TABLE daily_task_logs ADD COLUMN "
+                            "team_members JSON NOT NULL DEFAULT '[]'"
+                        )
+                    )
+                if not _sqlite_column_exists(conn, "workers", "laundry_id"):
+                    conn.execute(
+                        text("ALTER TABLE workers ADD COLUMN laundry_id VARCHAR")
+                    )
+                if not _sqlite_column_exists(conn, "daily_task_logs", "laundry_id"):
+                    conn.execute(
+                        text("ALTER TABLE daily_task_logs ADD COLUMN laundry_id VARCHAR")
+                    )
         logger.info("Schema migration check completed")
     except Exception:
         logger.exception("Schema migration failed")
@@ -181,9 +216,11 @@ def meta():
 def get_all_workers(
     active_only: bool = False,
     repo: WorkerRepository = Depends(get_repository),
+    current_user: dict = Depends(get_current_user),
 ):
-    """Get all laundry staff workers"""
-    return repo.get_all_workers(active_only=active_only)
+    """Get all laundry staff workers (scoped to the session's laundry)"""
+    lid = resolve_laundry_id(current_user)
+    return repo.get_all_workers(active_only=active_only, laundry_id=lid)
 
 
 @app.get(
@@ -194,11 +231,14 @@ def get_all_workers(
 def get_worker(
     worker_id: str,
     repo: WorkerRepository = Depends(get_repository),
+    current_user: dict = Depends(get_current_user),
 ):
-    worker = repo.get_worker_by_id(_coerce_db_id(worker_id))
+    lid = resolve_laundry_id(current_user)
+    worker = repo.get_worker_by_id(_coerce_db_id(worker_id), laundry_id=lid)
 
     if not worker:
         raise HTTPException(status_code=404, detail="Worker not found")
+    assert_same_laundry(worker, lid, "Worker")
     return worker
 
 
@@ -213,6 +253,7 @@ def create_worker(
     repo: WorkerRepository = Depends(get_repository),
     current_user: dict = Depends(get_current_user),
 ):
+    lid = resolve_laundry_id(current_user)
     if payload.department.upper() not in DEPARTMENTS:
         raise HTTPException(status_code=422, detail=f"Department must be one of {DEPARTMENTS}")
 
@@ -224,7 +265,7 @@ def create_worker(
         "joined_date": payload.joined_date,
         "notes": payload.notes,
     }
-    return repo.create_worker(worker_data)
+    return repo.create_worker(worker_data, laundry_id=lid)
 
 
 @app.put(
@@ -236,7 +277,9 @@ def update_worker(
     worker_id: str,
     payload: WorkerUpdate,
     repo: WorkerRepository = Depends(get_repository),
+    current_user: dict = Depends(get_current_user),
 ):
+    lid = resolve_laundry_id(current_user)
     if DB_TYPE == DatabaseType.MONGODB:
         worker_id = str(worker_id)
     else:
@@ -248,9 +291,10 @@ def update_worker(
             raise HTTPException(status_code=422, detail=f"Department must be one of {DEPARTMENTS}")
         update_data["department"] = update_data["department"].upper()
 
-    updated_worker = repo.update_worker(worker_id, update_data)
+    updated_worker = repo.update_worker(worker_id, update_data, laundry_id=lid)
     if not updated_worker:
         raise HTTPException(status_code=404, detail="Worker not found")
+    assert_same_laundry(updated_worker, lid, "Worker")
     return updated_worker
 
 
@@ -261,13 +305,19 @@ def update_worker(
 def delete_worker(
     worker_id: str,
     repo: WorkerRepository = Depends(get_repository),
+    current_user: dict = Depends(get_current_user),
 ):
+    lid = resolve_laundry_id(current_user)
     if DB_TYPE == DatabaseType.MONGODB:
         worker_id = str(worker_id)
     else:
         worker_id = _coerce_db_id(worker_id)
 
-    success = repo.delete_worker(worker_id)
+    # Scoped fetch first so cross-tenant ids hit the same 404 oracle.
+    existing = repo.get_worker_by_id(worker_id, laundry_id=lid)
+    assert_same_laundry(existing, lid, "Worker")
+
+    success = repo.delete_worker(worker_id, laundry_id=lid)
     if not success:
         raise HTTPException(status_code=404, detail="Worker not found")
     return {"message": "Worker deleted successfully"}
@@ -287,13 +337,16 @@ def get_all_daily_logs(
     date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     repo: WorkerRepository = Depends(get_repository),
+    current_user: dict = Depends(get_current_user),
 ):
     """Get daily task logs with optional date / worker / range filtering"""
+    lid = resolve_laundry_id(current_user)
     return repo.get_all_logs(
         work_date=work_date,
         worker_name=worker_name,
         date_from=date_from,
         date_to=date_to,
+        laundry_id=lid,
     )
 
 
@@ -305,14 +358,17 @@ def get_all_daily_logs(
 def get_daily_log(
     log_id: str,
     repo: WorkerRepository = Depends(get_repository),
+    current_user: dict = Depends(get_current_user),
 ):
+    lid = resolve_laundry_id(current_user)
     if DB_TYPE == DatabaseType.MONGODB:
-        log = repo.get_log_by_id(str(log_id))
+        log = repo.get_log_by_id(str(log_id), laundry_id=lid)
     else:
-        log = repo.get_log_by_id(_coerce_db_id(log_id))
+        log = repo.get_log_by_id(_coerce_db_id(log_id), laundry_id=lid)
 
     if not log:
         raise HTTPException(status_code=404, detail="Daily log not found")
+    assert_same_laundry(log, lid, "Daily log")
     return log
 
 
@@ -327,6 +383,7 @@ def create_daily_log(
     repo: WorkerRepository = Depends(get_repository),
     current_user: dict = Depends(get_current_user),
 ):
+    lid = resolve_laundry_id(current_user)
     _validate_log_payload(payload.shift, payload.attendance_status, payload.tasks)
 
     log_data = {
@@ -356,7 +413,7 @@ def create_daily_log(
         log_data["is_group_work"] = False
         log_data["team_members"] = []
 
-    return repo.create_log(log_data)
+    return repo.create_log(log_data, laundry_id=lid)
 
 
 @app.put(
@@ -368,7 +425,9 @@ def update_daily_log(
     log_id: str,
     payload: DailyLogUpdate,
     repo: WorkerRepository = Depends(get_repository),
+    current_user: dict = Depends(get_current_user),
 ):
+    lid = resolve_laundry_id(current_user)
     if DB_TYPE == DatabaseType.MONGODB:
         log_id = str(log_id)
     else:
@@ -407,19 +466,49 @@ def update_daily_log(
             t.model_dump() if hasattr(t, "model_dump") else t for t in update_data["tasks"]
         ]
 
-    # Recompute the worker_name label when a group is (re)defined on update.
-    if update_data.get("is_group_work") and update_data.get("team_members") is not None:
-        team = [m for m in update_data["team_members"] if m]
-        if len(team) < 2:
-            raise HTTPException(
-                status_code=422,
-                detail="Group work requires at least 2 team members",
-            )
-        update_data["worker_name"] = " + ".join(team)
+    # Recompute the worker_name label whenever the group definition is touched
+    # — flipping is_group_work, or editing team_members — not only when both
+    # arrive in the same body. Otherwise a team edit alone leaves an outdated
+    # "A + B" label (or group logs keep a stale single-worker name).
+    if "is_group_work" in update_data or "team_members" in update_data:
+        current = repo.get_log_by_id(log_id, laundry_id=lid)
+        if not current:
+            raise HTTPException(status_code=404, detail="Daily log not found")
+        assert_same_laundry(current, lid, "Daily log")
 
-    updated_log = repo.update_log(log_id, update_data)
+        effective_group = (
+            update_data["is_group_work"]
+            if "is_group_work" in update_data
+            else bool(current.get("is_group_work"))
+        )
+        if "team_members" in update_data:
+            team = [m for m in (update_data["team_members"] or []) if m]
+        else:
+            team = [m for m in (current.get("team_members") or []) if m]
+
+        if effective_group:
+            if "team_members" in update_data and len(team) < 2:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Group work requires at least 2 team members",
+                )
+            if not team:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Group work requires at least 2 team members",
+                )
+            update_data["worker_name"] = " + ".join(team)
+        else:
+            # Back to an individual log. Prefer an explicit worker_name; the
+            # group label holds no single base name to fall back on.
+            if not update_data.get("worker_name"):
+                update_data.pop("worker_name", None)
+            update_data["team_members"] = []
+
+    updated_log = repo.update_log(log_id, update_data, laundry_id=lid)
     if not updated_log:
         raise HTTPException(status_code=404, detail="Daily log not found")
+    assert_same_laundry(updated_log, lid, "Daily log")
     return updated_log
 
 
@@ -430,13 +519,19 @@ def update_daily_log(
 def delete_daily_log(
     log_id: str,
     repo: WorkerRepository = Depends(get_repository),
+    current_user: dict = Depends(get_current_user),
 ):
+    lid = resolve_laundry_id(current_user)
     if DB_TYPE == DatabaseType.MONGODB:
         log_id = str(log_id)
     else:
         log_id = _coerce_db_id(log_id)
 
-    success = repo.delete_log(log_id)
+    # Scoped fetch first so cross-tenant ids hit the same 404 oracle.
+    existing = repo.get_log_by_id(log_id, laundry_id=lid)
+    assert_same_laundry(existing, lid, "Daily log")
+
+    success = repo.delete_log(log_id, laundry_id=lid)
     if not success:
         raise HTTPException(status_code=404, detail="Daily log not found")
     return {"message": "Daily log deleted successfully"}
@@ -474,9 +569,11 @@ def _empty_summary(date_value: str) -> dict:
 def daily_summary(
     date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
     repo: WorkerRepository = Depends(get_repository),
+    current_user: dict = Depends(get_current_user),
 ):
     """Aggregated productivity summary for a single work date."""
-    logs = repo.get_all_logs(work_date=date)
+    lid = resolve_laundry_id(current_user)
+    logs = repo.get_all_logs(work_date=date, laundry_id=lid)
     s = _empty_summary(date)
 
     for log in logs:
@@ -518,9 +615,11 @@ def range_summary(
     date_from: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
     date_to: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
     repo: WorkerRepository = Depends(get_repository),
+    current_user: dict = Depends(get_current_user),
 ):
     """Per-worker aggregated totals over a date range — useful for payroll/reviews."""
-    logs = repo.get_all_logs(date_from=date_from, date_to=date_to)
+    lid = resolve_laundry_id(current_user)
+    logs = repo.get_all_logs(date_from=date_from, date_to=date_to, laundry_id=lid)
 
     per_worker: dict = {}
     for log in logs:
@@ -587,7 +686,7 @@ def range_summary(
     return {
         "date_from": date_from,
         "date_to": date_to,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utc_iso_z(),
         "workers": results,
     }
 
