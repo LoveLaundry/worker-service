@@ -158,6 +158,7 @@ class MongoDBWorkerRepository(WorkerRepository):
                 return None
 
             decrypted_original.update(update_data)
+            decrypted_original.pop("_id", None)
             decrypted_original.pop("created_at", None)
             decrypted_original["updated_at"] = datetime.now(UTC)
 
@@ -265,6 +266,7 @@ class MongoDBWorkerRepository(WorkerRepository):
                 return None
 
             decrypted_original.update(update_data)
+            decrypted_original.pop("_id", None)
             decrypted_original.pop("created_at", None)
 
             if "worker_name" in update_data:

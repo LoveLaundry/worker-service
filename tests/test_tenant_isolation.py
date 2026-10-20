@@ -248,9 +248,13 @@ def test_cross_tenant_update_and_delete_blocked(repo):
     assert still["notes"] is None
 
     # Own tenant keeps working, and the tenant stamp survives the update.
+    original_id = ObjectId(bob["id"])
     updated = repo.update_worker(bob["id"], {"notes": "mine"}, laundry_id="tenant-b")
     assert updated["notes"] == "mine"
     assert updated["laundry_id"] == "tenant-b"
+    raw = repo.workers.find_one({"_id": original_id})
+    assert raw is not None
+    assert raw["_id"] == original_id
     assert repo.delete_worker(bob["id"], laundry_id="tenant-b") is True
     assert repo.get_worker_by_id(bob["id"], laundry_id="tenant-b") is None
 
@@ -279,6 +283,14 @@ def test_log_cross_tenant_crud_blocked(repo):
     assert repo.update_log(log_b["id"], {"notes": "hax"}, laundry_id="tenant-a") is None
     assert repo.delete_log(log_b["id"], laundry_id="tenant-a") is False
     assert repo.get_log_by_id(log_b["id"], laundry_id="tenant-b") is not None
+
+    original_id = ObjectId(log_b["id"])
+    updated = repo.update_log(log_b["id"], {"notes": "mine"}, laundry_id="tenant-b")
+    assert updated["notes"] == "mine"
+    assert updated["laundry_id"] == "tenant-b"
+    raw = repo.logs.find_one({"_id": original_id})
+    assert raw is not None
+    assert raw["_id"] == original_id
 
 
 def test_log_date_filter_combined_with_tenant_scope(repo):
